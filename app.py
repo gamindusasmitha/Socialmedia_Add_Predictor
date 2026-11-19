@@ -17,14 +17,21 @@ load_dotenv()
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024  # reject requests bigger than 10 KB
 
-# Only these websites may call your backend.
-# When you host the page online, set ALLOWED_ORIGINS to your site address.
-# "null" is only for opening index.html by double-click while testing. Remove it when hosted.
-ALLOWED_ORIGINS = os.environ.get(
-    "ALLOWED_ORIGINS",
-    "http://127.0.0.1:5500,http://localhost:5500,null"
-).split(",")
-CORS(app, origins=ALLOWED_ORIGINS)
+# Allow Vercel frontend + local testing; override via ALLOWED_ORIGINS env var on Render
+DEFAULT_ORIGINS = [
+    "https://mlfrontend-three.vercel.app",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+]
+env_origins = os.environ.get("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [o.strip() for o in env_origins.split(",") if o.strip()] or DEFAULT_ORIGINS
+
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    allow_headers=["Content-Type"],
+    methods=["GET", "POST", "OPTIONS"],
+)
 
 # Stops one person from sending too many requests and using up your Gemini quota
 limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
@@ -33,16 +40,17 @@ limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set. Put it in the .env file or the host's environment settings.")
+
 gemini_client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(timeout=15000),  # 15 seconds per try
 )
 
-# First choice model, then backups if the first one is busy
-MODELS = ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.5-flash']
+# Standard Gemini models with fallback
+MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite']
 
 # Load the trained ML pipeline (only load a .pkl file that you made yourself)
-MODEL_PATH = 'social_media_addiction_model.pkl'
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'social_media_addiction_model.pkl')
 try:
     model_pipeline = joblib.load(MODEL_PATH)
     print(f"Loaded model from {MODEL_PATH}")
@@ -84,7 +92,8 @@ def ask_gemini(prompt):
                     model=model_name,
                     contents=prompt,
                 )
-                return response.text
+                if getattr(response, "text", None):
+                    return response.text
             except Exception as e:
                 print(f"{model_name} attempt {attempt + 1} failed: {e}")
                 time.sleep(2 ** attempt)
@@ -98,14 +107,14 @@ def generate_ai_recommendations(student_data, score, status):
     A student just took a social media addiction assessment and received a score of {score}/10 ({status}).
 
     Here are their daily habits:
-    - Age: {student_data['age']}
-    - Daily Social Media Usage: {student_data['daily_social_media_hours']} hours
-    - Primary Platform: {student_data['platform_usage']}
-    - Nightly Sleep: {student_data['sleep_hours']} hours
-    - Screen Time Right Before Sleep: {student_data['screen_time_before_sleep']} hours
-    - Current CGPA: {student_data['CGPA']}
-    - Physical Activity: {student_data['physical_activity']} hours/day
-    - Offline Social Interaction Level: {student_data['social_interaction_level']}
+- Age: {student_data['age']}
+- Daily Social Media Usage: {student_data['daily_social_media_hours']} hours
+- Primary Platform: {student_data['platform_usage']}
+- Nightly Sleep: {student_data['sleep_hours']} hours
+- Screen Time Right Before Sleep: {student_data['screen_time_before_sleep']} hours
+- Current CGPA: {student_data['CGPA']}
+- Physical Activity: {student_data['physical_activity']} hours/day
+- Offline Social Interaction Level: {student_data['social_interaction_level']}
 
     Provide 3 concise, practical, and empathetic bullet-point recommendations tailored specifically to their weakest habits (e.g., if sleep is low or screen time before bed is high, address that directly). Keep the tone encouraging and the response under 150 words. Do not use markdown headers.
     """
@@ -115,9 +124,20 @@ def generate_ai_recommendations(student_data, score, status):
     return "Could not generate personalized AI tips right now. Try setting daily app timers and avoiding screens 1 hour before bed."
 
 
-@app.route('/predict', methods=['POST'])
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ok",
+        "model_loaded": model_pipeline is not None,
+    })
+
+
+@app.route('/predict', methods=['POST', 'OPTIONS'])
 @limiter.limit("10 per minute")
 def predict():
+    if request.method == 'OPTIONS':
+        return ('', 204)
+
     if model_pipeline is None:
         return jsonify({"success": False, "error": "The prediction service is not ready."}), 500
 
@@ -176,7 +196,7 @@ def predict():
         })
 
     except Exception as e:
-        # Details go to your terminal only, not to the user
+        # Details go to server logs only, not to the user
         print(f"Prediction error: {e}")
         return jsonify({"success": False, "error": "Something went wrong on the server."}), 500
 
